@@ -1,0 +1,36 @@
+import express from 'express'; import cors from 'cors'; import bodyParser from 'body-parser';
+import { validate } from '@telegram-apps/init-data-node'; import OpenAI from 'openai'; import Airtable from 'airtable';
+const app=express(); app.use(cors()); app.use(bodyParser.json());
+
+const { BOT_TOKEN, OPENAI_API_KEY, AIRTABLE_API_KEY, AIRTABLE_BASE_ID } = process.env;
+const TABLE_LOANS='Loans', TABLE_DEPOSITS='Deposits';
+const openai=new OpenAI({ apiKey: OPENAI_API_KEY });
+const base=new Airtable({ apiKey: AIRTABLE_API_KEY }).base(AIRTABLE_BASE_ID);
+
+app.post('/offers', async (req,res)=>{ try{
+  const {type='loan',amount=0,term_months=12,max_monthly=null,down_payment_percent=0,initData=null}=req.body||{};
+  if(initData && BOT_TOKEN){ validate(initData, BOT_TOKEN, { expiresIn:3600 }); }
+  const table=type==='deposit'?TABLE_DEPOSITS:TABLE_LOANS;
+  const recs=await base(table).select({maxRecords:50}).all(); const products=recs.map(r=>({id:r.id,...r.fields}));
+  const n=+term_months||12, dp=(+down_payment_percent||0)/100;
+  const pmt=(P,apr,n)=>{const r=(+apr/100)/12; if(!r) return P/n; const k=Math.pow(1+r,n); return P*(r*k)/(k-1);};
+  let offers=[];
+  if(type==='loan'){
+    offers=products.map(p=>{ const baseAmt=amount*(1-dp);
+      const fees=(+p.fees_flat||0)+baseAmt*(+p.fees_percent||0)/100;
+      const principal=baseAmt+fees; const monthly=Math.round(pmt(principal,p.apr_percent,n));
+      return {bank:p.bank,product_name:p.product_name,apr_percent:p.apr_percent,monthly,principal,term_months:n,link:p.link};});
+    if(max_monthly) offers=offers.filter(o=>o.monthly<=max_monthly);
+    offers.sort((a,b)=>a.monthly-b.monthly); offers=offers.slice(0,3);
+  } else {
+    offers=products.sort((a,b)=>(+b.apy_percent||0)-(+a.apy_percent||0)).slice(0,3)
+      .map(p=>({bank:p.bank,product_name:p.product_name,apy_percent:p.apy_percent,term_months:p.term_months,link:p.link}));
+  }
+  let explanation=""; if(OPENAI_API_KEY){ const r=await openai.chat.completions.create({
+    model:'gpt-4o-mini', messages:[
+      {role:'system',content:'Ты финансовый помощник для Узбекистана. Пиши кратко.'},
+      {role:'user',content:`Запрос: тип=${type}, сумма=${amount}, срок=${term_months}, лимит=${max_monthly}. Офферы: ${JSON.stringify(offers)}. Дай короткую рекомендацию + 2 предупреждения.`}
+    ]}); explanation=r.choices?.[0]?.message?.content||""; }
+  res.json({offers,explanation});
+}catch(e){ console.error(e); res.status(400).json({error:e.message||'Bad Request'}); }});
+app.listen(process.env.PORT||8787,()=>console.log('API on'));
